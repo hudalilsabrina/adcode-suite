@@ -29,6 +29,37 @@ def load_dotenv_file(path: str = ".env") -> None:
 load_dotenv_file()
 
 
+def preflight() -> None:
+    """Gagal cepat kalau konfigurasi wajib belum diisi.
+
+    Tanpa ini, TEMPIK_BASE yang kosong jatuh ke placeholder mail.example.com
+    dan errornya jadi "No address associated with hostname" — kelihatan seperti
+    bug jaringan padahal cuma .env belum dibuat.
+    """
+    import os as _os
+    base = _os.environ.get("TEMPIK_BASE", "")
+    if not base or "example.com" in base:
+        raise SystemExit(
+            "TEMPIK_BASE belum diset.\n"
+            "  cp .env.example .env && chmod 600 .env\n"
+            "  lalu isi TEMPIK_BASE dengan endpoint temp mail kamu."
+        )
+    try:
+        import urllib.error as _ue
+        import urllib.request as _u
+        req = _u.Request(base.rstrip("/") + "/session",
+                         headers={"user-agent": "Mozilla/5.0"})
+        with _u.urlopen(req, timeout=15) as r:
+            r.read(1)
+    except _ue.HTTPError:
+        pass  # server menjawab (403/404 dsb) — host hidup, itu yang dicek
+    except Exception as e:
+        raise SystemExit(f"TEMPIK_BASE tidak bisa dihubungi ({base}): {type(e).__name__}: {e}")
+
+
+preflight()
+
+
 
 import argparse
 import json
