@@ -13,3 +13,4 @@ accounts.jsonl
 accounts.json
 tokens.txt
 cookies*.json
+.env

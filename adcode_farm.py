@@ -11,6 +11,25 @@ Results append to accounts.jsonl; history to farm.log.
 
 from __future__ import annotations
 
+def load_dotenv_file(path: str = ".env") -> None:
+    """Baca .env sederhana (KEY=VALUE) tanpa dependensi eksternal."""
+    import os as _os
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                _os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
+
+
+load_dotenv_file()
+
+
+
 import argparse
 import json
 import sys

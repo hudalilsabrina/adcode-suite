@@ -29,6 +29,25 @@ from __future__ import annotations
 
 import json
 import os
+
+def _load_dotenv(path=".env"):
+    """Baca .env (KEY=VALUE) tanpa dependensi eksternal."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, path), os.path.join(os.path.dirname(here), path)):
+        try:
+            with open(cand) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+            return
+        except FileNotFoundError:
+            continue
+
+
+_load_dotenv()
 import random
 import string
 import time
