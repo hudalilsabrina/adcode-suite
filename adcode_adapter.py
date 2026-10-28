@@ -134,6 +134,8 @@ class Pool:
             }
 
 
+UPSTREAM_TIMEOUT = int(os.environ.get("ADCODE_UPSTREAM_TIMEOUT", "120"))
+
 POOL = Pool(ACCOUNTS)
 
 
@@ -170,6 +172,31 @@ def _classify(acc: Account, status: int, body: str) -> None:
         acc.errors += 1
 
 
+def upstream_open(token: str, payload: dict):
+    """Buka koneksi SSE ke upstream dan kembalikan objek respons yang masih
+    bisa dibaca bertahap. Dipakai jalur streaming supaya token pertama sampai
+    ke client saat itu juga, bukan setelah seluruh jawaban selesai."""
+    body = dict(payload)
+    body["stream"] = True
+    req = urllib.request.Request(
+        f"{C.TAGFLOW}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={
+            "content-type": "application/json",
+            "user-agent": C.UA,
+            "authorization": f"Bearer {token}",
+            "accept": "text/event-stream",
+        },
+        method="POST",
+    )
+    try:
+        return urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT), None
+    except urllib.error.HTTPError as e:
+        return None, (e.code, e.read(), e.headers.get("content-type", ""))
+    except Exception as e:  # noqa: BLE001
+        return None, (0, f"{type(e).__name__}: {e}".encode(), "")
+
+
 def upstream_chat(token: str, payload: dict, stream: bool) -> tuple[int, bytes, str]:
     body = dict(payload)
     body["stream"] = True  # upstream always streams; we fold if the client didn't ask
@@ -185,7 +212,7 @@ def upstream_chat(token: str, payload: dict, stream: bool) -> tuple[int, bytes, 
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=300) as r:
+        with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT) as r:
             raw = r.read()
             return r.status, raw, r.headers.get("content-type", "")
     except urllib.error.HTTPError as e:
@@ -259,17 +286,45 @@ class Handler(BaseHTTPRequestHandler):
                     last_reason = f"refresh ditolak: {str(exc)[:60]}"
                 continue
 
-            status, raw, ctype = upstream_chat(token, payload, want_stream)
-            if status == 200:
-                if want_stream:
+            if want_stream:
+                resp, err = upstream_open(token, payload)
+                if resp is not None:
                     self.send_response(200)
                     self.send_header("content-type", "text/event-stream")
                     self.send_header("cache-control", "no-cache")
                     self.send_header("connection", "close")
                     self.end_headers()
-                    self.wfile.write(raw)
+                    try:
+                        for chunk in resp:
+                            if chunk:
+                                self.wfile.write(chunk)
+                                self.wfile.flush()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    finally:
+                        try:
+                            resp.close()
+                        except Exception:  # noqa: BLE001
+                            pass
                     return
+                status, raw, ctype = err
+            else:
+                status, raw, ctype = upstream_chat(token, payload, want_stream)
+
+            if status == 200:
                 folded = C._fold_sse(raw.decode(errors="replace"))  # noqa: SLF001
+                # 200 tapi kosong = model/akun bermasalah, bukan jawaban sah.
+                # Tanpa ini client menerima pesan kosong tanpa penjelasan.
+                try:
+                    _m = json.loads(folded)["choices"][0]["message"]
+                    _empty = not (_m.get("content") or "").strip() and not _m.get("tool_calls")
+                except Exception:  # noqa: BLE001
+                    _empty = True
+                if _empty:
+                    acc.errors += 1
+                    last_reason = "jawaban kosong dari upstream"
+                    last = (502, b'{"error":"empty completion"}', "application/json")
+                    continue
                 data = folded.encode()
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
@@ -278,7 +333,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(data)
                 return
 
-            _classify(acc, status, raw.decode(errors="replace"))
+            if status == 0:
+                # tidak sampai ke upstream sama sekali — akun belum tentu salah,
+                # tapi jangan dipilih lagi dalam waktu dekat
+                acc.state = "cooldown"
+                acc.cooldown_until = time.time() + 45
+                last_reason = "upstream tidak terjangkau"
+            else:
+                _classify(acc, status, raw.decode(errors="replace"))
             last = (status, raw, ctype)
 
         status, raw, _ = last
