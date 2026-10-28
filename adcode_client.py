@@ -245,11 +245,17 @@ def _err_code(body: str) -> str:
 
 
 def _fold_sse(raw: str) -> str:
-    """Collapse an SSE stream into a single OpenAI-shaped completion."""
+    """Collapse an SSE stream into a single OpenAI-shaped completion.
+
+    Tool calls arrive as incremental deltas (index -> partial function
+    arguments), so they have to be accumulated per index and reassembled —
+    dropping them makes every agent request look like an empty answer.
+    """
     text_parts: List[str] = []
     model = ""
     finish = "stop"
     usage_obj: Dict[str, Any] = {}
+    calls: Dict[int, Dict[str, Any]] = {}
     for line in raw.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -269,15 +275,36 @@ def _fold_sse(raw: str) -> str:
             piece = delta.get("content")
             if piece:
                 text_parts.append(piece)
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = calls.setdefault(
+                    idx, {"id": "", "type": "function",
+                          "function": {"name": "", "arguments": ""}})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["function"]["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["function"]["arguments"] += fn["arguments"]
             if ch.get("finish_reason"):
                 finish = ch["finish_reason"]
+    message: Dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
+    if calls:
+        ordered = [calls[i] for i in sorted(calls)]
+        for n, c in enumerate(ordered):
+            if not c["id"]:
+                c["id"] = f"call_{n}"
+        message["tool_calls"] = ordered
+        if not message["content"]:
+            message["content"] = None
     out = {
         "object": "chat.completion",
         "model": model or DEFAULT_MODEL,
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": "".join(text_parts)},
+                "message": message,
                 "finish_reason": finish,
             }
         ],

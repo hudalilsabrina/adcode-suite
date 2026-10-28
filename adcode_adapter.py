@@ -117,7 +117,8 @@ class Pool:
             cands = [a for a in self.accounts if a.uid not in exclude and a.alive()]
             if not cands:
                 return None
-            cands.sort(key=lambda a: a.used_at)
+            # akun bersih dulu, baru yang pernah gagal, lalu LRU
+            cands.sort(key=lambda a: (a.errors, a.used_at))
             a = cands[0]
             a.used_at = time.time()
             return a
@@ -134,6 +135,16 @@ class Pool:
 
 
 POOL = Pool(ACCOUNTS)
+
+
+TRANSIENT_HINTS = ("urlerror", "timed out", "timeout", "502", "503", "504",
+                   "connection", "tunnel", "network", "temporarily")
+
+
+def _transient(exc: BaseException) -> bool:
+    """Error jaringan = akun masih sehat, cuma jalurnya yang bermasalah."""
+    msg = f"{type(exc).__name__} {exc}".lower()
+    return any(h in msg for h in TRANSIENT_HINTS)
 
 
 def _classify(acc: Account, status: int, body: str) -> None:
@@ -226,15 +237,26 @@ class Handler(BaseHTTPRequestHandler):
 
         tried: set = set()
         last = (500, b'{"error":"no account"}', "")
-        for _ in range(3):
+        last_reason = ""
+        for _ in range(5):
             acc = POOL.pick(tried)
             if acc is None:
                 break
             tried.add(acc.uid)
             try:
                 token = acc.token()
-            except Exception:  # noqa: BLE001
-                acc.state = "dead"
+            except Exception as exc:  # noqa: BLE001
+                # Refresh token gagal karena jaringan ≠ akun mati. Tandai
+                # cooldown sebentar supaya tidak menghabiskan pool saat
+                # koneksi ke identitytoolkit sedang goyang.
+                if _transient(exc):
+                    acc.state = "cooldown"
+                    acc.cooldown_until = time.time() + 90
+                    last_reason = f"refresh jaringan: {type(exc).__name__}"
+                else:
+                    acc.state = "dead"
+                    acc.errors += 1
+                    last_reason = f"refresh ditolak: {str(exc)[:60]}"
                 continue
 
             status, raw, ctype = upstream_chat(token, payload, want_stream)
@@ -260,6 +282,15 @@ class Handler(BaseHTTPRequestHandler):
             last = (status, raw, ctype)
 
         status, raw, _ = last
+        if raw == b'{"error":"no account"}':
+            # tidak ada satu pun akun yang bisa dipakai — bedakan sebabnya
+            st = POOL.stats()
+            raw = json.dumps({
+                "error": "no usable account",
+                "reason": last_reason or "semua akun cooldown/dead",
+                "pool": st,
+            }).encode()
+            status = 503
         self.send_response(status or 502)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
