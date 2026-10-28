@@ -136,6 +136,22 @@ class Pool:
 
 UPSTREAM_TIMEOUT = int(os.environ.get("ADCODE_UPSTREAM_TIMEOUT", "120"))
 
+# Tagflow menolak SELURUH request kalau ada field yang tidak dikenal:
+#   400 {"code":"bad-request","message":"Send a supported chat request."}
+# Klien OpenAI-compatible (termasuk Hermes) rutin mengirim temperature, stop,
+# user, parallel_tool_calls, reasoning_effort, response_format, dll — semuanya
+# mematikan request. Jadi hanya field yang benar-benar didukung yang diteruskan.
+ALLOWED_FIELDS = {"model", "messages", "tools", "tool_choice", "max_tokens",
+                  "stream", "stream_options"}
+
+
+def sanitize(payload: dict) -> dict:
+    """Buang field yang tidak didukung upstream, pertahankan sisanya."""
+    out = {k: v for k, v in payload.items() if k in ALLOWED_FIELDS}
+    if "max_tokens" not in out and "max_completion_tokens" in payload:
+        out["max_tokens"] = payload["max_completion_tokens"]
+    return out
+
 POOL = Pool(ACCOUNTS)
 
 
@@ -256,6 +272,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             return self._json(400, {"error": "bad json"})
 
+        payload = sanitize(payload)
         want_stream = bool(payload.get("stream"))
         model = payload.get("model") or C.DEFAULT_MODEL
         if model not in C.MODELS:
